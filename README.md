@@ -2,10 +2,12 @@
 
 A flexible wrapper for LLM providers with caching, async support, and cost logging.
 
+<https://pypi.org/project/llm-wrapper-yl/>
+
 ## Installation
 
 ```bash
-pip install llm-wrapper
+pip install llm-wrapper-yl
 ```
 
 ## Quick Start
@@ -57,4 +59,11 @@ responses = provider.generate(["Your prompt here"])
 uv pip install '.[test]'
 # Run tests with output
 python -m pytest -s tests
+```
+
+## Deploying
+
+```bash
+hatch build
+twine upload dist/*
 ```

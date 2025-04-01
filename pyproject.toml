@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "llm-wrapper"
+name = "llm-wrapper-yl"
 version = "0.1.0"
 description = "A flexible wrapper for LLM providers with caching, async support, and cost tracking"
 readme = "README.md"
