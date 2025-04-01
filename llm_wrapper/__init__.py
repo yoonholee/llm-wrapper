@@ -1,3 +1,3 @@
-from .llm_wrapper import OpenAIProvider, LocalProvider
+from .llm_wrapper import Provider
 
-__all__ = ["OpenAIProvider", "LocalProvider"]
+__all__ = ["Provider"]

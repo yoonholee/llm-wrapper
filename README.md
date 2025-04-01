@@ -13,10 +13,10 @@ pip install llm-wrapper-yl
 ## Quick Start
 
 ```python
-from llm_wrapper import OpenAIProvider
+from llm_wrapper import Provider
 
 # Initialize the provider
-provider = OpenAIProvider(model="gpt-4o-mini", api_key="your-api-key")
+provider = Provider(model="gpt-4o-mini")
 
 # Generate a single response
 response = provider.generate("What is the capital of France?")
@@ -39,10 +39,10 @@ responses = provider.generate(
 ## Usage with Local Models
 
 ```python
-from llm_wrapper import LocalProvider
+from llm_wrapper import Provider
 
 # Initialize the provider with a local model
-provider = LocalProvider(
+provider = Provider(
     model="your-model-name",
     host="your-server-host",
     port=8000

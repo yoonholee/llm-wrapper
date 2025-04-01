@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llm-wrapper-yl"
-version = "0.1.0"
+version = "0.1.1"
 description = "A flexible wrapper for LLM providers with caching, async support, and cost tracking"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,6 +20,7 @@ dependencies = [
     "tenacity>=8.5.0",
     "tqdm>=4.67.1",
     "nest-asyncio>=1.6.0",
+    "together>=1.5.4",
 ]
 
 [project.optional-dependencies]

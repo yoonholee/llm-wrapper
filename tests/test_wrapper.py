@@ -2,10 +2,10 @@ import random
 import string
 import pytest
 from typing import List
-from llm_wrapper import OpenAIProvider
+from llm_wrapper import Provider
 import time
 
-MODELS_TO_TEST = ["gpt-4o-mini", "o3-mini"]
+MODELS_TO_TEST = ["gpt-4o-mini", "o3-mini", "deepseek-ai/DeepSeek-V3"]
 
 
 @pytest.fixture
@@ -14,17 +14,18 @@ def test_prompts() -> List[str]:
     all_chars = string.ascii_letters + string.digits + string.punctuation
     random_string = "".join(random.choices(all_chars, k=5))
     reverse_prompt = "Reverse the string: " + random_string
-    return [reverse_prompt]
+    return ["What is the capital of France?", reverse_prompt]
 
 
 @pytest.mark.parametrize("model_name", MODELS_TO_TEST)
-def test_model_generations(model_name: str, test_prompts: List[str]) -> None:
+def test_openai(model_name: str, test_prompts: List[str]) -> None:
     """Test different models with the same prompts."""
-    start = time.time()
-    provider = OpenAIProvider(model=model_name)
-    generation_kwargs = {"temperature": 1.0, "n": 2, "max_tokens": 1000}
-
     print(f"\n\n\n{'='*20} Testing {model_name} {'='*20}")
+
+    start = time.time()
+    provider = Provider(model=model_name)
+    generation_kwargs = {"temperature": 1.0, "n": 1, "max_tokens": 1000}
+
     all_responses = provider.generate(prompts=test_prompts, **generation_kwargs)
 
     # Basic validation

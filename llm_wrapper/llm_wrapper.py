@@ -5,9 +5,10 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union, Callable
+from typing import Any, Dict, List, Optional, Union, Callable, Type
 
 import diskcache as dc
+from together import Together
 import openai
 import requests
 import tenacity
@@ -37,6 +38,67 @@ class LLMConfig:
     cache_size_gb: int = 10
     cache_policy: str = "least-recently-used"
     max_concurrent_requests: int = 256
+
+
+class TokenCounter:
+    CHARS_PER_TOKEN = 4
+
+    def __init__(self, model: str):
+        if model in MODEL_COSTS:
+            self.input_cost, self.output_cost = (
+                MODEL_COSTS[model]["input"],
+                MODEL_COSTS[model]["output"],
+            )
+        else:
+            self.input_cost, self.output_cost = 0.0, 0.0
+        self.input_total, self.output_total = 0, 0
+        self.input_new, self.output_new = 0, 0
+
+    @staticmethod
+    def format_token_count(tokens: float) -> str:
+        """Convert token count to human readable string with appropriate unit."""
+        if tokens > 1_000_000:
+            return f"{tokens/1_000_000:.2f}M"
+        elif tokens > 1000:
+            return f"{tokens/1000:.1f}k"
+        return str(int(tokens))
+
+    def _update(self, prompt, response):
+        if "usage" in response.raw_response:
+            usage = response.raw_response["usage"]
+            input_tokens = usage["prompt_tokens"]
+            output_tokens = usage["completion_tokens"]
+        else:
+            input_tokens = len(prompt) / self.CHARS_PER_TOKEN
+            output_tokens = len(response.text) / self.CHARS_PER_TOKEN
+
+        self.input_total += input_tokens
+        self.output_total += output_tokens
+        if not response.cached:
+            self.input_new += input_tokens
+            self.output_new += output_tokens
+
+    def update(self, prompt, responses):
+        for response in responses:
+            self._update(prompt, response)
+
+    def print_cost(self):
+        cost_input_total = self.input_total * self.input_cost / 1_000_000
+        cost_output_total = self.output_total * self.output_cost / 1_000_000
+        cost_input_new = self.input_new * self.input_cost / 1_000_000
+        cost_output_new = self.output_new * self.output_cost / 1_000_000
+
+        input_total_str = self.format_token_count(self.input_total)
+        output_total_str = self.format_token_count(self.output_total)
+        input_new_str = self.format_token_count(self.input_new)
+        output_new_str = self.format_token_count(self.output_new)
+
+        print(
+            f"Total: ${cost_input_total + cost_output_total:.4f} ({input_total_str} input, {output_total_str} output)"
+        )
+        print(
+            f"New: ${cost_input_new + cost_output_new:.4f} ({input_new_str} input, {output_new_str} output)"
+        )
 
 
 @dataclass
@@ -166,47 +228,10 @@ class BaseProvider(ABC):
         pass
 
     def estimate_tokens(self, prompts, all_responses):
-        total_cost = 0.0
-        input_tokens = 0
-        output_tokens = 0
-
-        noncached_idxs = [i for i, responses in enumerate(all_responses) if not responses[0].cached]
-        for i in noncached_idxs:
-            prompt = prompts[i]
-            responses = all_responses[i]
-            for response in responses:
-                if "usage" in response.raw_response:
-                    usage = response.raw_response["usage"]
-                    input_tokens += usage["prompt_tokens"]
-                    output_tokens += usage["completion_tokens"]
-                else:
-                    # Fallback to character-based estimation if usage not available
-                    input_tokens += len(prompt) / 4
-                    output_tokens += len(response.text) / 4
-
-        if output_tokens == 0:
-            return
-
-        def get_readable_token_str(tokens):
-            if tokens > 1_000_000:
-                return f"{tokens/1_000_000:.2f}M"
-            elif tokens > 1000:
-                return f"{tokens/1000:.1f}k"
-            else:
-                return str(int(tokens))
-
-        if self.model in MODEL_COSTS:
-            model_costs = MODEL_COSTS[self.model]
-            total_cost = (input_tokens * model_costs["input"] / 1_000_000) + (
-                output_tokens * model_costs["output"] / 1_000_000
-            )
-            cost_str = f", estimated cost: ${total_cost:.4f}"
-        else:
-            cost_str = ""
-
-        input_token_str = get_readable_token_str(input_tokens)
-        output_token_str = get_readable_token_str(output_tokens)
-        print(f"Token count: {input_token_str} input, {output_token_str} output{cost_str}")
+        token_counter = TokenCounter(self.model)
+        for prompt, responses in zip(prompts, all_responses):
+            token_counter.update(prompt, responses)
+        token_counter.print_cost()
 
     def generate_from_messages(
         self, messages: List[Dict[str, str]], system_prompt: Optional[str] = None, **kwargs: Any
@@ -333,9 +358,7 @@ class OpenAIProvider(BaseProvider):
 class LocalProvider(BaseProvider):
     provider = "local"
 
-    def __init__(
-        self, model: str | None = None, host: str = "iris-hgx-1.stanford.edu", port: int = 8000
-    ):
+    def __init__(self, model: str | None, host: str, port: int):
         super().__init__(model=model)
         self.base_url = f"http://{host}:{port}"
         self._check_server_health()
@@ -377,3 +400,75 @@ class LocalProvider(BaseProvider):
             )
             for choice in response.choices
         ]
+
+
+class TogetherProvider(BaseProvider):
+    provider = "together"
+
+    def __init__(self, model: str, api_key: str | None = None):
+        super().__init__(model=model)
+
+        self.api_key = api_key or os.getenv("TOGETHER_API_KEY")
+        if not self.api_key:
+            raise ValueError("Together API key is required")
+        self.client = Together(api_key=self.api_key)
+
+    @create_retry_decorator()
+    async def _chat_completions_create(
+        self, messages: List[Dict[str, str]], **kwargs: Any
+    ) -> List[LLMResponse]:
+        """Together-specific implementation of chat completion."""
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: self.client.chat.completions.create(
+                model=self.model, messages=messages, **kwargs
+            ),
+        )
+        return [
+            LLMResponse(
+                text=choice.message.content,
+                raw_response=response.model_dump(),
+                provider=self.provider,
+                model=self.model,
+                cached=False,
+            )
+            for choice in response.choices
+        ]
+
+
+class Provider(BaseProvider):
+    """Factory class to create the appropriate provider instance."""
+
+    @classmethod
+    def _get_provider_class(cls, model: str) -> Type[BaseProvider]:
+        if model in ["gpt-4o-mini", "gpt-4o", "o3-mini", "o1-mini", "o1", "gpt-4.5-preview"]:
+            print(f"Using OpenAI provider for {model}")
+            return OpenAIProvider
+        elif model in [
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
+            "deepseek-ai/DeepSeek-V3",
+            "deepseek-ai/DeepSeek-R1",
+            "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+        ]:
+            print(f"Using Together provider for {model}")
+            return TogetherProvider
+        else:
+            print(f"Using Local provider for {model}")
+            return LocalProvider
+
+    def __new__(
+        cls,
+        model: str = None,
+        api_key: Optional[str] = None,
+        host: str = "iris-hgx-1.stanford.edu",
+        port: int = 8000,
+        **kwargs,
+    ) -> BaseProvider:
+        """Factory method to create the appropriate provider instance."""
+        provider_class = cls._get_provider_class(model)
+
+        if provider_class == LocalProvider:
+            return provider_class(model=model, host=host, port=port, **kwargs)
+        else:
+            return provider_class(model=model, api_key=api_key, **kwargs)
