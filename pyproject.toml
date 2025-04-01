@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-wrapper"
+version = "0.1.0"
+description = "A flexible wrapper for LLM providers with caching, async support, and cost tracking"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Yoonho Lee", email = "yoonho@stanford.edu" }
+]
+
+dependencies = [
+    "diskcache>=5.6.3",
+    "openai>=1.65.1",
+    "requests>=2.31.0",
+    "tenacity>=8.5.0",
+    "tqdm>=4.67.1",
+    "nest-asyncio>=1.6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.3.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/yoonholee/llm-wrapper"
+Repository = "https://github.com/yoonholee/llm-wrapper.git"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["llm_wrapper"]
+exclude = ["*.pyc"] 

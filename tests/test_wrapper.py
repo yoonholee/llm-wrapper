@@ -1,0 +1,45 @@
+import random
+import string
+import pytest
+from typing import List
+from llm_wrapper import OpenAIProvider
+import time
+
+MODELS_TO_TEST = ["gpt-4o-mini", "o3-mini"]
+
+
+@pytest.fixture
+def test_prompts() -> List[str]:
+    """Fixture to generate test prompts."""
+    all_chars = string.ascii_letters + string.digits + string.punctuation
+    random_string = "".join(random.choices(all_chars, k=5))
+    reverse_prompt = "Reverse the string: " + random_string
+    return [reverse_prompt]
+
+
+@pytest.mark.parametrize("model_name", MODELS_TO_TEST)
+def test_model_generations(model_name: str, test_prompts: List[str]) -> None:
+    """Test different models with the same prompts."""
+    start = time.time()
+    provider = OpenAIProvider(model=model_name)
+    generation_kwargs = {"temperature": 1.0, "n": 2, "max_tokens": 1000}
+
+    print(f"\n\n\n{'='*20} Testing {model_name} {'='*20}")
+    all_responses = provider.generate(prompts=test_prompts, **generation_kwargs)
+
+    # Basic validation
+    assert len(all_responses) == len(test_prompts)
+
+    # Print and validate each response
+    for responses, prompt in zip(all_responses, test_prompts):
+        assert isinstance(responses, list)
+        assert len(responses) == generation_kwargs["n"]
+        assert all(isinstance(r, str) for r in responses)
+        assert all(len(r) > 0 for r in responses)
+
+        print(f"\nPrompt: {prompt[:50]}...")
+        for i, response in enumerate(responses, 1):
+            print(f"Response {i}: {response[:100]}...")
+        print(f"Token count: {len(response.split())}")  # Simple token count
+
+    print(f"Time taken: {time.time() - start} seconds")
