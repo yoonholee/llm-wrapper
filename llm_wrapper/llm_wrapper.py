@@ -35,9 +35,9 @@ def get_cache_root() -> str:
 class LLMConfig:
     """Configuration for LLM providers and caching"""
 
-    cache_size_gb: int = 10
+    cache_size_gb: int = 2
     cache_policy: str = "least-recently-used"
-    max_concurrent_requests: int = 256
+    max_concurrent_requests: int = 16
 
 
 class TokenCounter:

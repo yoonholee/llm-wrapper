@@ -18,7 +18,7 @@ def test_prompts() -> List[str]:
 
 
 @pytest.mark.parametrize("model_name", MODELS_TO_TEST)
-def test_openai(model_name: str, test_prompts: List[str]) -> None:
+def test_wrapper(model_name: str, test_prompts: List[str]) -> None:
     """Test different models with the same prompts."""
     print(f"\n\n\n{'='*20} Testing {model_name} {'='*20}")
 
@@ -43,4 +43,13 @@ def test_openai(model_name: str, test_prompts: List[str]) -> None:
             print(f"Response {i}: {response[:100]}...")
         print(f"Token count: {len(response.split())}")  # Simple token count
 
+    print(f"Time taken: {time.time() - start} seconds")
+
+
+def test_cache():
+    prompts = ["What is the capital of France?"]
+    provider = Provider(model="gpt-4o-mini")
+    start = time.time()
+    provider.generate(prompts)
+    provider.generate(prompts * 1000)  # Should be cached
     print(f"Time taken: {time.time() - start} seconds")
