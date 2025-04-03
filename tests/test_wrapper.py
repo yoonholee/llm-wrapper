@@ -53,3 +53,10 @@ def test_cache():
     provider.generate(prompts)
     provider.generate(prompts * 1000)  # Should be cached
     print(f"Time taken: {time.time() - start} seconds")
+
+
+def test_force_new():
+    prompts = ["What is the capital of France?"]
+    provider = Provider(model="gpt-4o-mini")
+    provider.generate(prompts, force_new=True)
+    provider.generate(prompts, force_new=True)  # Should be cached

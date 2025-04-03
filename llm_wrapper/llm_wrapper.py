@@ -175,23 +175,26 @@ class BaseProvider(ABC):
         return hashlib.sha256(final_key.encode()).hexdigest()
 
     async def _check_cache_and_generate_single(
-        self, prompt: str, system_prompt: str = "", **kwargs
+        self, prompt: str, system_prompt: str = "", force_new: bool = False, **kwargs
     ) -> LLMResponse:
         """Generate a single chat completion with caching."""
         cache_key = self._get_cache_key(prompt, system_prompt, **kwargs)
-        cached_response = self.cache.get(cache_key)
-        if cached_response is not None:
-            choices = cached_response["raw_response"]["choices"]
-            return [
-                LLMResponse(
-                    text=choice["message"]["content"],
-                    raw_response=cached_response["raw_response"],
-                    provider=self.provider,
-                    model=self.model,
-                    cached=True,
-                )
-                for choice in choices
-            ]
+        
+        # Only check cache if not forcing new response
+        if not force_new:
+            cached_response = self.cache.get(cache_key)
+            if cached_response is not None:
+                choices = cached_response["raw_response"]["choices"]
+                return [
+                    LLMResponse(
+                        text=choice["message"]["content"],
+                        raw_response=cached_response["raw_response"],
+                        provider=self.provider,
+                        model=self.model,
+                        cached=True,
+                    )
+                    for choice in choices
+                ]
 
         messages = []
         if system_prompt:
@@ -200,11 +203,10 @@ class BaseProvider(ABC):
 
         responses = await self._chat_completions_create(messages, **kwargs)
         self.cache[cache_key] = {"raw_response": responses[0].raw_response}
-        # The "raw response" contains all n responses
         return responses
 
     async def _check_cache_and_generate(
-        self, prompts: List[str], system_prompt: str = "", **kwargs
+        self, prompts: List[str], system_prompt: str = "", force_new: bool = False, **kwargs
     ) -> List[LLMResponse]:
         semaphore = asyncio.Semaphore(value=self.config.max_concurrent_requests)
         pbar = kwargs.pop("progress_bar", None)  # Get progress bar from kwargs
@@ -212,7 +214,7 @@ class BaseProvider(ABC):
         async def run_single(prompt: str) -> LLMResponse:
             async with semaphore:
                 response = await self._check_cache_and_generate_single(
-                    prompt, system_prompt, **kwargs
+                    prompt, system_prompt, force_new=force_new, **kwargs
                 )
                 if pbar:
                     pbar.update(1)
@@ -274,6 +276,7 @@ class BaseProvider(ABC):
         system_prompt: Optional[str] = None,
         text_only: bool = True,
         silent: bool = False,
+        force_new: bool = False,
         **kwargs: Any,
     ) -> List[List[str]]:
         async def _async_generate() -> List[LLMResponse]:
@@ -284,7 +287,11 @@ class BaseProvider(ABC):
             )
             try:
                 all_responses = await self._check_cache_and_generate(
-                    prompts=prompt_list, system_prompt=system_prompt, progress_bar=pbar, **kwargs
+                    prompts=prompt_list, 
+                    system_prompt=system_prompt, 
+                    force_new=force_new,
+                    progress_bar=pbar, 
+                    **kwargs
                 )
             except Exception as e:
                 print(f"Error processing prompts: {str(e)}")
@@ -441,7 +448,10 @@ class Provider(BaseProvider):
 
     @classmethod
     def _get_provider_class(cls, model: str) -> Type[BaseProvider]:
-        if model in ["gpt-4o-mini", "gpt-4o", "o3-mini", "o1-mini", "o1", "gpt-4.5-preview"]:
+        if "gpt" in model:
+            print(f"Using OpenAI provider for {model}")
+            return OpenAIProvider
+        elif model in ["o3-mini", "o1-mini", "o1"]:
             print(f"Using OpenAI provider for {model}")
             return OpenAIProvider
         elif model in [
