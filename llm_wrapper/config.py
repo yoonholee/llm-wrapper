@@ -16,6 +16,8 @@ MODEL_COSTS: Dict[str, Dict[str, float]] = {
     "o1": {"input": 15.00, "output": 60.00},
     "gpt-3.5-turbo": {"input": 0.50, "output": 1.50},
     "gpt-4.5-preview": {"input": 75.0, "output": 150.0},
+    "google/gemma-2b-it": {"input": 0.1, "output": 0.1},
+    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo-classifier": {"input": 0.18, "output": 0.18},
     "meta-llama/Llama-3.3-70B-Instruct-Turbo": {"input": 0.88, "output": 0.88},
     "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": {"input": 3.50, "output": 3.50},
     "deepseek-ai/DeepSeek-V3": {"input": 1.25, "output": 1.25},
