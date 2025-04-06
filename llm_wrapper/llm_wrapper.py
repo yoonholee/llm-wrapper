@@ -179,7 +179,7 @@ class BaseProvider(ABC):
     ) -> LLMResponse:
         """Generate a single chat completion with caching."""
         cache_key = self._get_cache_key(prompt, system_prompt, **kwargs)
-        
+
         # Only check cache if not forcing new response
         if not force_new:
             cached_response = self.cache.get(cache_key)
@@ -287,11 +287,11 @@ class BaseProvider(ABC):
             )
             try:
                 all_responses = await self._check_cache_and_generate(
-                    prompts=prompt_list, 
-                    system_prompt=system_prompt, 
+                    prompts=prompt_list,
+                    system_prompt=system_prompt,
                     force_new=force_new,
-                    progress_bar=pbar, 
-                    **kwargs
+                    progress_bar=pbar,
+                    **kwargs,
                 )
             except Exception as e:
                 print(f"Error processing prompts: {str(e)}")
@@ -460,6 +460,8 @@ class Provider(BaseProvider):
             "deepseek-ai/DeepSeek-V3",
             "deepseek-ai/DeepSeek-R1",
             "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+            "google/gemma-2b-it",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo-classifier",
         ]:
             print(f"Using Together provider for {model}")
             return TogetherProvider
