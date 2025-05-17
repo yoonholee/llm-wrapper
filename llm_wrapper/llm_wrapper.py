@@ -176,7 +176,7 @@ class BaseProvider(ABC):
 
     async def _check_cache_and_generate_single(
         self, prompt: str, system_prompt: str = "", force_new: bool = False, **kwargs
-    ) -> LLMResponse:
+    ) -> List[LLMResponse]:
         """Generate a single chat completion with caching."""
         cache_key = self._get_cache_key(prompt, system_prompt, **kwargs)
 
@@ -207,11 +207,11 @@ class BaseProvider(ABC):
 
     async def _check_cache_and_generate(
         self, prompts: List[str], system_prompt: str = "", force_new: bool = False, **kwargs
-    ) -> List[LLMResponse]:
+    ) -> List[List[LLMResponse]]:
         semaphore = asyncio.Semaphore(value=self.config.max_concurrent_requests)
         pbar = kwargs.pop("progress_bar", None)  # Get progress bar from kwargs
 
-        async def run_single(prompt: str) -> LLMResponse:
+        async def run_single(prompt: str) -> List[LLMResponse]:
             async with semaphore:
                 response = await self._check_cache_and_generate_single(
                     prompt, system_prompt, force_new=force_new, **kwargs
@@ -282,8 +282,8 @@ class BaseProvider(ABC):
         silent: bool = False,
         force_new: bool = False,
         **kwargs: Any,
-    ) -> List[List[str]]:
-        async def _async_generate() -> List[LLMResponse]:
+    ) -> List[List[str]] | List[List[LLMResponse]]:
+        async def _async_generate() -> List[List[LLMResponse]]:
             prompt_list = prompts if isinstance(prompts, list) else [prompts]
 
             pbar = tqdm.asyncio.tqdm(
@@ -458,8 +458,8 @@ class Provider(BaseProvider):
     """Factory class to create the appropriate provider instance."""
 
     @classmethod
-    def _get_provider_class(cls, model: str) -> Type[BaseProvider]:
-        if "gpt" in model:
+    def _get_provider_class(cls, model: Optional[str]) -> Type[BaseProvider]:
+        if model and "gpt" in model:
             print(f"Using OpenAI provider for {model}")
             return OpenAIProvider
         elif model in ["o3-mini", "o1-mini", "o1"]:
