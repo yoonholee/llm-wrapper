@@ -261,14 +261,18 @@ class BaseProvider(ABC):
             return [response.text for response in responses]
 
         try:
-            return asyncio.run(_async_generate_single(messages))
+            loop = asyncio.get_running_loop()
+            is_running = loop.is_running()
         except RuntimeError:
-            # For running inside a notebook
+            loop = None
+            is_running = False
+
+        if is_running:
             import nest_asyncio
 
             nest_asyncio.apply()
-            event_loop = asyncio.get_event_loop()
-            return event_loop.run_until_complete(_async_generate_single(messages))
+            return loop.run_until_complete(_async_generate_single(messages))
+        return asyncio.run(_async_generate_single(messages))
 
     def generate(
         self,
@@ -309,13 +313,20 @@ class BaseProvider(ABC):
             return all_responses
 
         try:
-            return asyncio.run(_async_generate())
-        except RuntimeError:
-            import nest_asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                is_running = loop.is_running()
+            except RuntimeError:
+                loop = None
+                is_running = False
 
-            nest_asyncio.apply()
-            event_loop = asyncio.get_event_loop()
-            return event_loop.run_until_complete(_async_generate())
+            if is_running:
+                import nest_asyncio
+
+                nest_asyncio.apply()
+                return loop.run_until_complete(_async_generate())
+            else:
+                return asyncio.run(_async_generate())
         except KeyboardInterrupt:
             print("Received interrupt signal, shutting down gracefully...")
             raise
