@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union, Callable, Type
@@ -19,6 +20,8 @@ from .config import MODEL_COSTS, RETRY_CONFIG
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 BYTES_PER_GB = 1024 * 1024 * 1024
+
+openai_reasoning_models = ["o1-mini", "o1", "o3-mini", "o3", "o4-mini"]
 
 
 def get_cache_root() -> str:
@@ -146,7 +149,8 @@ class BaseProvider(ABC):
         self.config = config
 
         cache_root = get_cache_root()
-        cache_dir = os.path.join(cache_root, "llm_wrapper")
+        cwd = Path.cwd().name
+        cache_dir = os.path.join(cache_root, "llm_wrapper", cwd)
         os.makedirs(cache_dir, exist_ok=True)
         print(f"Using cache dir: {cache_dir}")
 
@@ -352,7 +356,7 @@ class OpenAIProvider(BaseProvider):
     ) -> List[LLMResponse]:
         """OpenAI-specific implementation of chat completion."""
         # Handle max_tokens parameter for different model requirements
-        if self.model in ["o1", "o3-mini", "o1-mini"]:
+        if self.model in openai_reasoning_models:
             if "max_tokens" in kwargs:
                 kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
             kwargs.pop("temperature", None)
@@ -459,10 +463,7 @@ class Provider(BaseProvider):
 
     @classmethod
     def _get_provider_class(cls, model: Optional[str]) -> Type[BaseProvider]:
-        if model and "gpt" in model:
-            print(f"Using OpenAI provider for {model}")
-            return OpenAIProvider
-        elif model in ["o3-mini", "o1-mini", "o1"]:
+        if model in openai_reasoning_models or "gpt" in model:
             print(f"Using OpenAI provider for {model}")
             return OpenAIProvider
         elif model in [
@@ -471,8 +472,6 @@ class Provider(BaseProvider):
             "deepseek-ai/DeepSeek-V3",
             "deepseek-ai/DeepSeek-R1",
             "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
-            "google/gemma-2b-it",
-            "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo-classifier",
         ]:
             print(f"Using Together provider for {model}")
             return TogetherProvider

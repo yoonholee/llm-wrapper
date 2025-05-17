@@ -7,7 +7,7 @@ name = "llm-wrapper-yl"
 version = "0.1.3"
 description = "A flexible wrapper for LLM providers with caching, async support, and cost tracking"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [
     { name = "Yoonho Lee", email = "yoonho@stanford.edu" }
@@ -20,7 +20,7 @@ dependencies = [
     "tenacity>=8.5.0",
     "tqdm>=4.67.1",
     "nest-asyncio>=1.6.0",
-    "together>=1.5.4",
+    "together",
 ]
 
 [project.optional-dependencies]
