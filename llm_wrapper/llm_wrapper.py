@@ -1,5 +1,6 @@
 """LLM Wrapper with caching, async, retries, and cost tracking."""
-
+import transformers
+from vllm import LLM, SamplingParams
 import asyncio
 import hashlib
 import json
@@ -22,17 +23,6 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 BYTES_PER_GB = 1024 * 1024 * 1024
 
-
-def get_cache_root() -> str:
-    """Get the cache root directory from a list of candidates."""
-    if os.getenv("LLM_WRAPPER_CACHE_ROOT"):
-        cache_root = os.getenv("LLM_WRAPPER_CACHE_ROOT")
-    else:
-        cache_root = os.path.expanduser("~/.cache")
-    print(f"Using cache root: {cache_root}")
-    return cache_root
-
-
 @dataclass
 class LLMConfig:
     """Configuration for LLM providers and caching"""
@@ -46,30 +36,22 @@ class TokenCounter:
     CHARS_PER_TOKEN = 4
 
     def __init__(self, model: str):
-        if model in MODEL_COSTS:
-            self.input_cost, self.output_cost = (
-                MODEL_COSTS[model]["input"],
-                MODEL_COSTS[model]["output"],
-            )
-        else:
-            self.input_cost, self.output_cost = 0.0, 0.0
-        self.input_total, self.output_total = 0, 0
-        self.input_new, self.output_new = 0, 0
+        costs = MODEL_COSTS.get(model, {"input": 0.0, "output": 0.0})
+        self.input_cost, self.output_cost = costs["input"], costs["output"]
+        self.input_total = self.output_total = self.input_new = self.output_new = 0
 
     @staticmethod
     def format_token_count(tokens: float) -> str:
-        """Convert token count to human readable string with appropriate unit."""
-        if tokens > 1_000_000:
-            return f"{tokens/1_000_000:.2f}M"
-        elif tokens > 1000:
-            return f"{tokens/1000:.1f}k"
-        return str(int(tokens))
+        return (
+            f"{tokens/1_000_000:.2f}M"
+            if tokens > 1_000_000
+            else f"{tokens/1000:.1f}k" if tokens > 1000 else str(int(tokens))
+        )
 
     def _update(self, prompt, response):
         if "usage" in response.raw_response:
             usage = response.raw_response["usage"]
-            input_tokens = usage["prompt_tokens"]
-            output_tokens = usage["completion_tokens"]
+            input_tokens, output_tokens = usage["prompt_tokens"], usage["completion_tokens"]
         else:
             input_tokens = len(prompt) / self.CHARS_PER_TOKEN
             output_tokens = len(response.text) / self.CHARS_PER_TOKEN
@@ -85,22 +67,19 @@ class TokenCounter:
             self._update(prompt, response)
 
     def print_cost(self):
-        cost_input_total = self.input_total * self.input_cost / 1_000_000
-        cost_output_total = self.output_total * self.output_cost / 1_000_000
-        cost_input_new = self.input_new * self.input_cost / 1_000_000
-        cost_output_new = self.output_new * self.output_cost / 1_000_000
+        def calc_stats(input_tokens, output_tokens):
+            cost = (input_tokens * self.input_cost + output_tokens * self.output_cost) / 1_000_000
+            return (
+                cost,
+                self.format_token_count(input_tokens),
+                self.format_token_count(output_tokens),
+            )
 
-        input_total_str = self.format_token_count(self.input_total)
-        output_total_str = self.format_token_count(self.output_total)
-        input_new_str = self.format_token_count(self.input_new)
-        output_new_str = self.format_token_count(self.output_new)
+        total_cost, total_in, total_out = calc_stats(self.input_total, self.output_total)
+        new_cost, new_in, new_out = calc_stats(self.input_new, self.output_new)
 
-        print(
-            f"Total: ${cost_input_total + cost_output_total:.4f} ({input_total_str} input, {output_total_str} output)"
-        )
-        print(
-            f"New: ${cost_input_new + cost_output_new:.4f} ({input_new_str} input, {output_new_str} output)"
-        )
+        print(f"Total: ${total_cost:.4f} ({total_in} input, {total_out} output)")
+        print(f"New: ${new_cost:.4f} ({new_in} input, {new_out} output)")
 
 
 @dataclass
@@ -120,60 +99,57 @@ class BaseProvider(ABC):
     def __init__(self, model: str, config: LLMConfig = LLMConfig()):
         self.model = model
         self.config = config
+        self.token_counter = TokenCounter(model)
 
-        cache_root = get_cache_root()
-        cwd = Path.cwd().name
-        cache_dir = os.path.join(cache_root, "llm_wrapper", cwd)
+        cache_root = os.getenv("LLM_WRAPPER_CACHE_ROOT", os.path.expanduser("~/.cache"))
+        model_name_safe = model.replace("/", "_")[-20:]
+        current_dir = os.path.basename(os.getcwd())
+        cache_dir = f"{cache_root}/llm_wrapper/{current_dir}/{model_name_safe}"
         os.makedirs(cache_dir, exist_ok=True)
-        print(f"Using cache dir: {cache_dir}")
 
         self.cache = dc.Cache(
             cache_dir,
             size_limit=self.config.cache_size_gb * BYTES_PER_GB,
             eviction_policy=self.config.cache_policy,
         )
-        size_bytes = self.cache.volume()
-        cache_path = self.cache.directory
-        print(f"Cache path: {cache_path}")
-        print(f"Current cache size: {size_bytes / BYTES_PER_GB:.2f}/{self.config.cache_size_gb}GB")
-
-    def estimate_tokens(self, prompts, all_responses):
-        token_counter = TokenCounter(self.model)
-        for prompt, responses in zip(prompts, all_responses):
-            token_counter.update(prompt, responses)
-        token_counter.print_cost()
+        print(f"Cache path: {self.cache.directory}")
+        print(
+            f"Current cache size: {self.cache.volume() / BYTES_PER_GB:.2f}/{self.config.cache_size_gb}GB"
+        )
 
     def _generate_cache_key(self, prompt: str, system_prompt: str = "", **kwargs) -> str:
         """Generate deterministic cache key for a single message."""
-        prompt_hash = hashlib.sha256(json.dumps(prompt).encode()).hexdigest()
-        system_hash = (
-            hashlib.sha256(system_prompt.encode()).hexdigest()
-            if system_prompt
-            else "no_system_prompt"
-        )
-        kwargs_str = "|".join(f"{k}:{str(v)}" for k, v in sorted(kwargs.items()))
-        kwargs_hash = hashlib.sha256(kwargs_str.encode()).hexdigest()
-        components = [self.provider, self.model, system_hash, prompt_hash, kwargs_hash]
-        final_key = "|".join(components)
-        return hashlib.sha256(final_key.encode()).hexdigest()
+        components = [
+            self.provider,
+            self.model,
+            (
+                hashlib.sha256(system_prompt.encode()).hexdigest()
+                if system_prompt
+                else "no_system_prompt"
+            ),
+            hashlib.sha256(json.dumps(prompt).encode()).hexdigest(),
+            hashlib.sha256(
+                "|".join(f"{k}:{str(v)}" for k, v in sorted(kwargs.items())).encode()
+            ).hexdigest(),
+        ]
+        return hashlib.sha256("|".join(components).encode()).hexdigest()
 
-    def get_cached_response(self, prompt: str, system_prompt: str = "", **kwargs) -> LLMResponse:
-        cache_key = self._generate_cache_key(prompt, system_prompt, **kwargs)
-        cached_response = self.cache.get(cache_key)
-        if cached_response == None:
+    def get_cached_response(
+        self, prompt: str, system_prompt: str = "", **kwargs
+    ) -> Optional[List[LLMResponse]]:
+        cached = self.cache.get(self._generate_cache_key(prompt, system_prompt, **kwargs))
+        if not cached:
             return None
-        choices = cached_response["raw_response"]["choices"]
-        response_list = [
+        return [
             LLMResponse(
                 text=choice["message"]["content"],
-                raw_response=cached_response["raw_response"],
+                raw_response=cached["raw_response"],
                 provider=self.provider,
                 model=self.model,
                 cached=True,
             )
-            for choice in choices
+            for choice in cached["raw_response"]["choices"]
         ]
-        return response_list
 
     def generate(
         self,
@@ -183,46 +159,28 @@ class BaseProvider(ABC):
         silent: bool = False,
         force_new: bool = False,
         **kwargs: Any,
-    ) -> List[List[str]] | List[List[LLMResponse]]:
-        prompts = prompts if isinstance(prompts, list) else [prompts]
-        if force_new:
-            cached_responses = [None] * len(prompts)
-        else:
-            cached_responses = [
-                self.get_cached_response(prompt, system_prompt, **kwargs) for prompt in prompts
-            ]
-
-        uncached_idxs = [i for i, response in enumerate(cached_responses) if response is None]
-        if len(uncached_idxs) == 0:
-            all_responses = cached_responses
-            if text_only:
-                all_responses = [
-                    [response.text for response in responses] for responses in all_responses
-                ]
-            return all_responses
-
-        uncached_prompts = [prompts[i] for i in uncached_idxs]
-        uncached_responses = self.generate_uncached(
-            uncached_prompts, system_prompt, silent, **kwargs
-        )
-        uncached_keys = [
-            self._generate_cache_key(uncached_prompts[i], system_prompt, **kwargs)
-            for i in range(len(uncached_prompts))
+    ) -> Union[List[List[str]], List[List[LLMResponse]]]:
+        prompts = [prompts] if isinstance(prompts, str) else prompts
+        cached_responses = [
+            None if force_new else self.get_cached_response(p, system_prompt, **kwargs)
+            for p in prompts
         ]
-        for key, response in zip(uncached_keys, uncached_responses):
-            self.cache[key] = {"raw_response": response[0].raw_response}
 
-        all_responses = []
-        for i in range(len(prompts)):
-            if cached_responses[i] is not None:
-                all_responses.append(cached_responses[i])
-            else:
-                all_responses.append(uncached_responses[uncached_idxs.index(i)])
-        if text_only:
-            all_responses = [
-                [response.text for response in responses] for responses in all_responses
-            ]
-        return all_responses
+        uncached_idxs = [i for i, r in enumerate(cached_responses) if r is None]
+        if uncached_idxs:
+            uncached_prompts = [prompts[i] for i in uncached_idxs]
+            new_responses = self.generate_uncached(
+                uncached_prompts, system_prompt, silent, **kwargs
+            )
+            for i, resp in zip(uncached_idxs, new_responses):
+                cached_responses[i] = resp
+                key = self._generate_cache_key(prompts[i], system_prompt, **kwargs)
+                self.cache[key] = {"raw_response": resp[0].raw_response}
+
+        return [
+            [r.text for r in responses] if text_only else responses
+            for responses in cached_responses
+        ]
 
     @abstractmethod
     def generate_uncached(
@@ -230,22 +188,24 @@ class BaseProvider(ABC):
     ) -> List[List[LLMResponse]]:
         pass
 
+    def estimate_tokens(
+        self, prompts: Union[str, List[str]], responses: List[List[LLMResponse]]
+    ) -> None:
+        """Update token counter with prompt and response tokens."""
+        prompts = [prompts] if isinstance(prompts, str) else prompts
+        for prompt, response_list in zip(prompts, responses):
+            self.token_counter.update(prompt, response_list)
+
+    def print_cost(self) -> None:
+        self.token_counter.print_cost()
+
 
 def create_retry_decorator(
     max_retries: int = RETRY_CONFIG["max_retries"],
     base_delay: float = RETRY_CONFIG["base_delay"],
     max_delay: float = RETRY_CONFIG["max_delay"],
 ) -> Callable:
-    """Create a retry decorator with exponential backoff.
-
-    Args:
-        max_retries: Maximum number of retry attempts
-        base_delay: Initial delay between retries in seconds
-        max_delay: Maximum delay between retries in seconds
-
-    Returns:
-        Retry decorator configured with exponential backoff
-    """
+    """Create a retry decorator with exponential backoff."""
     return tenacity.retry(
         stop=tenacity.stop_after_attempt(max_retries),
         wait=tenacity.wait_exponential(multiplier=base_delay, min=base_delay, max=max_delay),
@@ -305,6 +265,7 @@ class APIProviderMixin:
 
             if not silent:
                 self.estimate_tokens(prompts, all_responses)
+                self.print_cost()
             return all_responses
 
         try:
@@ -395,24 +356,124 @@ class TogetherProvider(APIProviderMixin, BaseProvider):
         ]
 
 
+class vLLMProvider(BaseProvider):
+    provider = "vllm"
+
+    def __init__(
+        self, model: str, context_length: int = 1024, compile_model: bool = False, **kwargs
+    ):
+        self.compile_model = compile_model
+        self.set_vllm_environment()
+        super().__init__(model=model)
+        self.context_length = context_length
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(model)
+        self.llm = None
+
+    def lazy_load_model(self):
+        if self.llm is None:
+            self.llm = LLM(
+                model=self.model,
+                dtype="bfloat16",
+                trust_remote_code=True,
+                max_model_len=self.context_length,
+                max_seq_len_to_capture=self.context_length,
+                enforce_eager=not self.compile_model
+            )
+
+    def set_vllm_environment(self):
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        local_scratch = "/scr-ssd" if os.path.exists("/scr-ssd") else "/scr"
+        os.environ["VLLM_CACHE_ROOT"] = os.path.join(local_scratch, "yoonho", "vllm_cache")
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0;8.9+PTX"
+        if "TRANSFORMERS_CACHE" in os.environ:
+            os.environ["HF_HOME"] = os.environ["TRANSFORMERS_CACHE"]
+            del os.environ["TRANSFORMERS_CACHE"]
+
+        if self.compile_model:
+            os.environ["VLLM_USE_PRECOMPILED"] = "1"
+            os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+        else:
+            os.environ["TORCH_COMPILE_DISABLE"] = "1"
+            os.environ["TORCH_DYNAMO_DISABLE"] = "1"
+            os.environ["VLLM_USE_PRECOMPILED"] = "0"
+            os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "0"
+            os.environ["VLLM_ATTENTION_BACKEND"] = "PYTORCH"
+
+    def generate_uncached(
+        self, prompts: List[str], system_prompt: str = "", silent: bool = False, **kwargs: Any
+    ) -> List[List[LLMResponse]]:
+        """Generate responses for uncached prompts using vLLM."""
+        self.lazy_load_model()  # Ensure model is loaded
+
+        conversations = []
+        for prompt in prompts:
+            conversation = [{"role": "user", "content": prompt}]
+            if system_prompt:
+                conversation = [{"role": "system", "content": system_prompt}] + conversation
+            conversations.append(conversation)
+        conversations_chat = self.tokenizer.apply_chat_template(conversations, tokenize=False)
+
+        sampling_params = SamplingParams(
+            max_tokens=kwargs.get("max_tokens", self.context_length),
+            temperature=kwargs.get("temperature", 0.6),
+            top_p=kwargs.get("top_p", 1.0),
+            n=kwargs.get("n", 1),
+        )
+
+        all_responses = self.llm.generate(conversations_chat, sampling_params=sampling_params)
+        llm_response_list = []
+        for prompt_outputs in all_responses:
+            llm_responses = []
+            choices = []
+            for output in prompt_outputs.outputs:
+                choices.append({
+                    "message": {"content": output.text, "role": "assistant"},
+                    "finish_reason": output.finish_reason
+                })
+                
+            raw_response = {
+                "choices": choices,
+                "model": self.model,
+                "usage": {
+                    "prompt_tokens": len(self.tokenizer.encode(prompt_outputs.prompt)),
+                    "completion_tokens": sum(len(self.tokenizer.encode(output.text)) for output in prompt_outputs.outputs),
+                    "total_tokens": len(self.tokenizer.encode(prompt_outputs.prompt)) + 
+                                  sum(len(self.tokenizer.encode(output.text)) for output in prompt_outputs.outputs)
+                },
+            }
+            
+            for output in prompt_outputs.outputs:
+                llm_responses.append(
+                    LLMResponse(
+                        text=output.text,
+                        raw_response=raw_response,
+                        provider=self.provider,
+                        model=self.model,
+                        cached=False,
+                    )
+                )
+            llm_response_list.append(llm_responses)
+        
+        if not silent:
+            self.estimate_tokens(prompts, llm_response_list)
+            self.print_cost()
+            
+        return llm_response_list
+
+
 class Provider:
     """Factory class to create the appropriate provider instance."""
 
     @classmethod
-    def _get_provider_class(cls, model: Optional[str]) -> Type[BaseProvider]:
-        client = Together()
-        together_models = [model.id for model in client.models.list()]
-
+    def _get_provider_class(cls, model: str) -> Type[BaseProvider]:
+        together_models = [m.id for m in Together().models.list()]
         if model in OpenAIProvider.reasoning_models or "gpt" in model:
-            print(f"Using OpenAI provider for {model}")
             return OpenAIProvider
         elif model in together_models:
-            print(f"Using Together provider for {model}")
             return TogetherProvider
         else:
-            raise ValueError(f"Unsupported model: {model}")
+            return vLLMProvider
 
     def __new__(cls, model: str = None, **kwargs) -> BaseProvider:
-        """Factory method to create the appropriate provider instance."""
-        provider_class = cls._get_provider_class(model)
-        return provider_class(model=model, **kwargs)
+        return cls._get_provider_class(model)(model=model, **kwargs)

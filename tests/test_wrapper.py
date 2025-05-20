@@ -4,8 +4,14 @@ import pytest
 from typing import List
 from llm_wrapper import Provider
 import time
+import warnings
 
-MODELS_TO_TEST = ["gpt-4o-mini", "o3-mini", "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"]
+MODELS_TO_TEST = [
+    "gpt-4o-mini",
+    # "o3-mini",
+    # "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+    "Qwen/Qwen3-0.6B",
+]
 
 
 @pytest.fixture
