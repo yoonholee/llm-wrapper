@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hint_generation"
+version = "0.1.0"
+description = "generate textual hints for math problems"
+requires-python = ">=3.11, <3.12"
+dependencies = [
+    "vllm>=0.8.5",
+    "flashinfer-python==0.2.2",
+    "torch==2.6",
+    "transformers>=4.51.3",
+    "numpy",
+    "tqdm",
+    "datasets",
+    "openai",
+    "ipykernel",
+    "ipdb",
+    "sympy",
+    "loguru",
+    "black",
+    "matplotlib",
+    "asynciolimiter",
+    "tenacity",
+    "setuptools",
+    "antlr4-python3-runtime",
+    "prettytable",
+    "faiss-cpu",
+    "absl-py",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["hint_generation"]
+exclude = [
+    "*.pyc",
+    "*.pyo",
+    "*.pyd",
+    "*.pyw",
+    "*.pyz",
+    "checkpoints/",
+    "figures/",
+    "logs/",
+    "results/",
+]
