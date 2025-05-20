@@ -5,7 +5,7 @@ from typing import List
 from llm_wrapper import Provider
 import time
 
-MODELS_TO_TEST = ["gpt-4o-mini", "o3-mini", "deepseek-ai/DeepSeek-V3"]
+MODELS_TO_TEST = ["gpt-4o-mini", "o3-mini", "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"]
 
 
 @pytest.fixture
@@ -47,15 +47,15 @@ def test_wrapper(model_name: str, test_prompts: List[str]) -> None:
 
 
 def test_cache():
+    print(f"\n\n\n{'='*20} Testing cache {'='*20}")
     prompts = ["What is the capital of France?"]
     provider = Provider(model="gpt-4o-mini")
-    start = time.time()
-    provider.generate(prompts)
+    provider.generate(prompts, force_new=True)
     provider.generate(prompts * 1000)  # Should be cached
-    print(f"Time taken: {time.time() - start} seconds")
 
 
 def test_force_new():
+    print(f"\n\n\n{'='*20} Testing force_new {'='*20}")
     prompts = ["What is the capital of France?"]
     provider = Provider(model="gpt-4o-mini")
     provider.generate(prompts, force_new=True)

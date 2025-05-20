@@ -1,3 +1,5 @@
+"""LLM Wrapper with caching, async, retries, and cost tracking."""
+
 import asyncio
 import hashlib
 import json
@@ -11,7 +13,6 @@ from typing import Any, Dict, List, Optional, Union, Callable, Type
 import diskcache as dc
 from together import Together
 import openai
-import requests
 import tenacity
 import tqdm.asyncio
 
@@ -20,8 +21,6 @@ from .config import MODEL_COSTS, RETRY_CONFIG
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 BYTES_PER_GB = 1024 * 1024 * 1024
-
-openai_reasoning_models = ["o1-mini", "o1", "o3-mini", "o3", "o4-mini"]
 
 
 def get_cache_root() -> str:
@@ -40,7 +39,7 @@ class LLMConfig:
 
     cache_size_gb: int = 2
     cache_policy: str = "least-recently-used"
-    max_concurrent_requests: int = 16
+    max_concurrent_requests: int = 64
 
 
 class TokenCounter:
@@ -115,6 +114,123 @@ class LLMResponse:
     cached: bool = False
 
 
+class BaseProvider(ABC):
+    """A wrapper for interacting with LLM providers. Supports local caching, async, retries, and cost tracking."""
+
+    def __init__(self, model: str, config: LLMConfig = LLMConfig()):
+        self.model = model
+        self.config = config
+
+        cache_root = get_cache_root()
+        cwd = Path.cwd().name
+        cache_dir = os.path.join(cache_root, "llm_wrapper", cwd)
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"Using cache dir: {cache_dir}")
+
+        self.cache = dc.Cache(
+            cache_dir,
+            size_limit=self.config.cache_size_gb * BYTES_PER_GB,
+            eviction_policy=self.config.cache_policy,
+        )
+        size_bytes = self.cache.volume()
+        cache_path = self.cache.directory
+        print(f"Cache path: {cache_path}")
+        print(f"Current cache size: {size_bytes / BYTES_PER_GB:.2f}/{self.config.cache_size_gb}GB")
+
+    def estimate_tokens(self, prompts, all_responses):
+        token_counter = TokenCounter(self.model)
+        for prompt, responses in zip(prompts, all_responses):
+            token_counter.update(prompt, responses)
+        token_counter.print_cost()
+
+    def _generate_cache_key(self, prompt: str, system_prompt: str = "", **kwargs) -> str:
+        """Generate deterministic cache key for a single message."""
+        prompt_hash = hashlib.sha256(json.dumps(prompt).encode()).hexdigest()
+        system_hash = (
+            hashlib.sha256(system_prompt.encode()).hexdigest()
+            if system_prompt
+            else "no_system_prompt"
+        )
+        kwargs_str = "|".join(f"{k}:{str(v)}" for k, v in sorted(kwargs.items()))
+        kwargs_hash = hashlib.sha256(kwargs_str.encode()).hexdigest()
+        components = [self.provider, self.model, system_hash, prompt_hash, kwargs_hash]
+        final_key = "|".join(components)
+        return hashlib.sha256(final_key.encode()).hexdigest()
+
+    def get_cached_response(self, prompt: str, system_prompt: str = "", **kwargs) -> LLMResponse:
+        cache_key = self._generate_cache_key(prompt, system_prompt, **kwargs)
+        cached_response = self.cache.get(cache_key)
+        if cached_response == None:
+            return None
+        choices = cached_response["raw_response"]["choices"]
+        response_list = [
+            LLMResponse(
+                text=choice["message"]["content"],
+                raw_response=cached_response["raw_response"],
+                provider=self.provider,
+                model=self.model,
+                cached=True,
+            )
+            for choice in choices
+        ]
+        return response_list
+
+    def generate(
+        self,
+        prompts: Union[str, List[str]],
+        system_prompt: Optional[str] = None,
+        text_only: bool = True,
+        silent: bool = False,
+        force_new: bool = False,
+        **kwargs: Any,
+    ) -> List[List[str]] | List[List[LLMResponse]]:
+        prompts = prompts if isinstance(prompts, list) else [prompts]
+        if force_new:
+            cached_responses = [None] * len(prompts)
+        else:
+            cached_responses = [
+                self.get_cached_response(prompt, system_prompt, **kwargs) for prompt in prompts
+            ]
+
+        uncached_idxs = [i for i, response in enumerate(cached_responses) if response is None]
+        if len(uncached_idxs) == 0:
+            all_responses = cached_responses
+            if text_only:
+                all_responses = [
+                    [response.text for response in responses] for responses in all_responses
+                ]
+            return all_responses
+
+        uncached_prompts = [prompts[i] for i in uncached_idxs]
+        uncached_responses = self.generate_uncached(
+            uncached_prompts, system_prompt, silent, **kwargs
+        )
+        uncached_keys = [
+            self._generate_cache_key(uncached_prompts[i], system_prompt, **kwargs)
+            for i in range(len(uncached_prompts))
+        ]
+        for key, response in zip(uncached_keys, uncached_responses):
+            self.cache[key] = {"raw_response": response[0].raw_response}
+
+        all_responses = []
+        for i in range(len(prompts)):
+            if cached_responses[i] is not None:
+                all_responses.append(cached_responses[i])
+            else:
+                all_responses.append(uncached_responses[uncached_idxs.index(i)])
+        if text_only:
+            all_responses = [
+                [response.text for response in responses] for responses in all_responses
+            ]
+        return all_responses
+
+    @abstractmethod
+    def generate_uncached(
+        self, prompts: List[str], system_prompt: str = "", **kwargs
+    ) -> List[List[LLMResponse]]:
+        pass
+
+
 def create_retry_decorator(
     max_retries: int = RETRY_CONFIG["max_retries"],
     base_delay: float = RETRY_CONFIG["base_delay"],
@@ -141,150 +257,39 @@ def create_retry_decorator(
     )
 
 
-class BaseProvider(ABC):
-    """A wrapper for interacting with LLM providers. Supports local caching, async, retries, and cost tracking."""
+class APIProviderMixin:
+    """A mixin for interacting with LLM providers that use API calls."""
 
-    def __init__(self, model: str, config: LLMConfig = LLMConfig()):
-        self.model = model
-        self.config = config
-
-        cache_root = get_cache_root()
-        cwd = Path.cwd().name
-        cache_dir = os.path.join(cache_root, "llm_wrapper", cwd)
-        os.makedirs(cache_dir, exist_ok=True)
-        print(f"Using cache dir: {cache_dir}")
-
-        self.cache = dc.Cache(
-            cache_dir,
-            size_limit=self.config.cache_size_gb * BYTES_PER_GB,
-            eviction_policy=self.config.cache_policy,
-        )
-        size_bytes = self.cache.volume()
-        cache_path = self.cache.directory
-        print(f"Cache path: {cache_path}")
-        print(f"Current cache size: {size_bytes / BYTES_PER_GB:.2f}/{self.config.cache_size_gb}GB")
-
-    def _get_cache_key(self, prompt: str, system_prompt: str = "", **kwargs) -> str:
-        """Generate cache key for a single message."""
-        prompt_hash = hashlib.sha256(json.dumps(prompt).encode()).hexdigest()
-        system_hash = (
-            hashlib.sha256(system_prompt.encode()).hexdigest()
-            if system_prompt
-            else "no_system_prompt"
-        )
-        kwargs_str = "|".join(f"{k}:{str(v)}" for k, v in sorted(kwargs.items()))
-        kwargs_hash = hashlib.sha256(kwargs_str.encode()).hexdigest()
-        components = [self.provider, self.model, system_hash, prompt_hash, kwargs_hash]
-        final_key = "|".join(components)
-        return hashlib.sha256(final_key.encode()).hexdigest()
-
-    async def _check_cache_and_generate_single(
-        self, prompt: str, system_prompt: str = "", force_new: bool = False, **kwargs
+    async def _generate_single(
+        self, prompt: str, system_prompt: str = "", **kwargs
     ) -> List[LLMResponse]:
         """Generate a single chat completion with caching."""
-        cache_key = self._get_cache_key(prompt, system_prompt, **kwargs)
-
-        # Only check cache if not forcing new response
-        if not force_new:
-            cached_response = self.cache.get(cache_key)
-            if cached_response is not None:
-                choices = cached_response["raw_response"]["choices"]
-                return [
-                    LLMResponse(
-                        text=choice["message"]["content"],
-                        raw_response=cached_response["raw_response"],
-                        provider=self.provider,
-                        model=self.model,
-                        cached=True,
-                    )
-                    for choice in choices
-                ]
-
-        messages = []
+        messages = [{"role": "user", "content": prompt}]
         if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-
+            messages = [{"role": "system", "content": system_prompt}] + messages
         responses = await self._chat_completions_create(messages, **kwargs)
-        self.cache[cache_key] = {"raw_response": responses[0].raw_response}
         return responses
 
-    async def _check_cache_and_generate(
-        self, prompts: List[str], system_prompt: str = "", force_new: bool = False, **kwargs
+    async def _generate(
+        self, prompts: List[str], system_prompt: str = "", **kwargs
     ) -> List[List[LLMResponse]]:
         semaphore = asyncio.Semaphore(value=self.config.max_concurrent_requests)
-        pbar = kwargs.pop("progress_bar", None)  # Get progress bar from kwargs
+        pbar = kwargs.pop("progress_bar", None)
 
         async def run_single(prompt: str) -> List[LLMResponse]:
             async with semaphore:
-                response = await self._check_cache_and_generate_single(
-                    prompt, system_prompt, force_new=force_new, **kwargs
-                )
+                response = await self._generate_single(prompt, system_prompt, **kwargs)
                 if pbar:
                     pbar.update(1)
                 return response
 
         return await asyncio.gather(*[run_single(p) for p in prompts])
 
-    @abstractmethod
-    async def _chat_completions_create(
-        self, messages: List[Dict[str, str]], **kwargs: Any
-    ) -> List[LLMResponse]:
-        """Provider-specific implementation of chat completion."""
-        pass
-
-    def estimate_tokens(self, prompts, all_responses):
-        token_counter = TokenCounter(self.model)
-        for prompt, responses in zip(prompts, all_responses):
-            token_counter.update(prompt, responses)
-        token_counter.print_cost()
-
-    def generate_from_messages(
-        self, messages: List[Dict[str, str]], system_prompt: Optional[str] = None, **kwargs: Any
-    ) -> List[LLMResponse]:
-        async def _async_generate_single(messages: List[Dict[str, str]]):
-            cache_key = self._get_cache_key(messages, system_prompt, **kwargs)
-            cached_response = self.cache.get(cache_key)
-            if cached_response is not None:
-                choices = cached_response["raw_response"]["choices"]
-                responses = [
-                    LLMResponse(
-                        text=choice["message"]["content"],
-                        raw_response=cached_response["raw_response"],
-                        provider=self.provider,
-                        model=self.model,
-                        cached=True,
-                    )
-                    for choice in choices
-                ]
-                return [response.text for response in responses]
-            if system_prompt is not None:
-                messages = [{"role": "system", "content": system_prompt}] + messages
-            responses = await self._chat_completions_create(messages, **kwargs)
-            self.cache[cache_key] = {"raw_response": responses[0].raw_response}
-            return [response.text for response in responses]
-
-        try:
-            loop = asyncio.get_running_loop()
-            is_running = loop.is_running()
-        except RuntimeError:
-            loop = None
-            is_running = False
-
-        if is_running:
-            import nest_asyncio
-
-            nest_asyncio.apply()
-            return loop.run_until_complete(_async_generate_single(messages))
-        return asyncio.run(_async_generate_single(messages))
-
-    def generate(
+    def generate_uncached(
         self,
         prompts: Union[str, List[str]],
         system_prompt: Optional[str] = None,
-        text_only: bool = True,
         silent: bool = False,
-        force_new: bool = False,
         **kwargs: Any,
     ) -> List[List[str]] | List[List[LLMResponse]]:
         async def _async_generate() -> List[List[LLMResponse]]:
@@ -293,27 +298,13 @@ class BaseProvider(ABC):
             pbar = tqdm.asyncio.tqdm(
                 total=len(prompt_list), desc="Generating responses", disable=silent
             )
-            try:
-                all_responses = await self._check_cache_and_generate(
-                    prompts=prompt_list,
-                    system_prompt=system_prompt,
-                    force_new=force_new,
-                    progress_bar=pbar,
-                    **kwargs,
-                )
-            except Exception as e:
-                print(f"Error processing prompts: {str(e)}")
-                raise
-            finally:
-                pbar.close()
+            all_responses = await self._generate(
+                prompts=prompt_list, system_prompt=system_prompt, progress_bar=pbar, **kwargs
+            )
+            pbar.close()
 
             if not silent:
                 self.estimate_tokens(prompts, all_responses)
-
-            if text_only:
-                all_responses = [
-                    [response.text for response in responses] for responses in all_responses
-                ]
             return all_responses
 
         try:
@@ -339,16 +330,13 @@ class BaseProvider(ABC):
             raise
 
 
-class OpenAIProvider(BaseProvider):
+class OpenAIProvider(APIProviderMixin, BaseProvider):
     provider = "openai"
+    reasoning_models = ["o1", "o3", "o1-mini", "o3-mini", "o4-mini"]
 
-    def __init__(self, model: str, api_key: str | None = None):
-        super().__init__(model=model)
-
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OpenAI API key is required")
-        self.client = openai.AsyncOpenAI(api_key=self.api_key)
+    def __init__(self, model: str):
+        super().__init__(model)
+        self.client = openai.AsyncOpenAI()
 
     @create_retry_decorator()
     async def _chat_completions_create(
@@ -356,7 +344,7 @@ class OpenAIProvider(BaseProvider):
     ) -> List[LLMResponse]:
         """OpenAI-specific implementation of chat completion."""
         # Handle max_tokens parameter for different model requirements
-        if self.model in openai_reasoning_models:
+        if self.model in self.reasoning_models:
             if "max_tokens" in kwargs:
                 kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
             kwargs.pop("temperature", None)
@@ -377,63 +365,12 @@ class OpenAIProvider(BaseProvider):
         ]
 
 
-class LocalProvider(BaseProvider):
-    provider = "local"
-
-    def __init__(self, model: str | None, host: str, port: int):
-        super().__init__(model=model)
-        self.base_url = f"http://{host}:{port}"
-        self._check_server_health()
-        self.available_models = self._get_available_models()
-        if self.model is None:
-            self.model = self.available_models[0]
-            print(f"Using default model: {self.model}")
-        assert self.model in self.available_models
-        self.client = openai.AsyncOpenAI(base_url=f"{self.base_url}/v1", api_key=None)
-
-    def _check_server_health(self) -> None:
-        """Check server health and verify model availability."""
-        requests.get(f"{self.base_url}/health", timeout=5)
-        print(f"Successfully connected to SGLang server at {self.base_url}")
-
-    def _get_available_models(self) -> List[str]:
-        """Retrieve list of available models from the server."""
-        response = requests.get(f"{self.base_url}/v1/models", timeout=5)
-        available_models = response.json()["data"]
-        model_ids = [model["id"] for model in available_models]
-        print(f"Available models: {model_ids}")
-        return model_ids
-
-    @create_retry_decorator()
-    async def _chat_completions_create(
-        self, messages: List[Dict[str, str]], **kwargs: Any
-    ) -> List[LLMResponse]:
-        """Local hosted implementation of chat completion with rate limiting."""
-        response = await self.client.chat.completions.create(
-            model=self.model, messages=messages, **kwargs
-        )
-        return [
-            LLMResponse(
-                text=choice.message.content,
-                raw_response=response.model_dump(),
-                provider=self.provider,
-                model=self.model,
-                cached=False,
-            )
-            for choice in response.choices
-        ]
-
-
-class TogetherProvider(BaseProvider):
+class TogetherProvider(APIProviderMixin, BaseProvider):
     provider = "together"
 
-    def __init__(self, model: str, api_key: str | None = None):
+    def __init__(self, model: str):
         super().__init__(model=model)
-
-        self.api_key = api_key or os.getenv("TOGETHER_API_KEY")
-        if not self.api_key:
-            raise ValueError("Together API key is required")
-        self.client = Together(api_key=self.api_key)
+        self.client = Together()
 
     @create_retry_decorator()
     async def _chat_completions_create(
@@ -458,39 +395,24 @@ class TogetherProvider(BaseProvider):
         ]
 
 
-class Provider(BaseProvider):
+class Provider:
     """Factory class to create the appropriate provider instance."""
 
     @classmethod
     def _get_provider_class(cls, model: Optional[str]) -> Type[BaseProvider]:
-        if model in openai_reasoning_models or "gpt" in model:
+        client = Together()
+        together_models = [model.id for model in client.models.list()]
+
+        if model in OpenAIProvider.reasoning_models or "gpt" in model:
             print(f"Using OpenAI provider for {model}")
             return OpenAIProvider
-        elif model in [
-            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-            "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
-            "deepseek-ai/DeepSeek-V3",
-            "deepseek-ai/DeepSeek-R1",
-            "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
-        ]:
+        elif model in together_models:
             print(f"Using Together provider for {model}")
             return TogetherProvider
         else:
-            print(f"Using Local provider for {model}")
-            return LocalProvider
+            raise ValueError(f"Unsupported model: {model}")
 
-    def __new__(
-        cls,
-        model: str = None,
-        api_key: Optional[str] = None,
-        host: str = "iris-hgx-1.stanford.edu",
-        port: int = 8000,
-        **kwargs,
-    ) -> BaseProvider:
+    def __new__(cls, model: str = None, **kwargs) -> BaseProvider:
         """Factory method to create the appropriate provider instance."""
         provider_class = cls._get_provider_class(model)
-
-        if provider_class == LocalProvider:
-            return provider_class(model=model, host=host, port=port, **kwargs)
-        else:
-            return provider_class(model=model, api_key=api_key, **kwargs)
+        return provider_class(model=model, **kwargs)
